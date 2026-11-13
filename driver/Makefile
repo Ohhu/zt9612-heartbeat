@@ -37,7 +37,7 @@ modules:
 sign: modules
 	@if [ ! -f $(MOK_PRIV) ] || [ ! -f $(MOK_PEM) ]; then \
 		echo "错误：找不到签名密钥 $(MOK_PRIV) / $(MOK_PEM)"; \
-		echo "生成密钥与 MOK 注册流程见 README.md「Secure Boot」一节"; \
+		echo "生成密钥与 MOK 注册流程见 docs/INSTALL.md「Secure Boot 签名」一节"; \
 		exit 1; \
 	fi
 	$(KSRC)/scripts/sign-file sha256 $(MOK_PRIV) $(MOK_PEM) $(MODNAME).ko

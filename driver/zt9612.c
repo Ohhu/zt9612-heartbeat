@@ -10,7 +10,11 @@
  *   - /dev/zt9612 字符设备：原始报文通道，报文头 "WLAN" + u16 hlen + u16 type
  *
  * 协议来自 USB 抓包与实验记录：结论见仓库 CHANGELOG 与 re/REPORT*.md、re/DRIVER_PROGRESS.md
- * （re/ 为本地保留目录，不随公开仓库发布）。 */
+ * （re/ 为上游本地保留目录，不随公开仓库发布）。
+ *
+ * 本文件的修改声明：2026-11-13，zt9612-heartbeat 基于上游 Spkicn/zt9612-linux v0.3.2 修改。
+ * 改动为心跳周期与固定节拍（新增模块参数 hb_interval_ms）、心跳补发点前移到命令发出之前、
+ * 扫描期间分片睡眠补心跳、卸载收尾加固；明细见本仓库 docs/CHANGELOG.md。 */
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/module.h>

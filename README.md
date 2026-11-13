@@ -1,207 +1,145 @@
-# zt9612: ZT9612U (ZTOP / ACEV100) USB Wi-Fi 6 driver for Linux
+# zt9612-heartbeat
 
-[![build](https://github.com/Spkicn/zt9612-linux/actions/workflows/build.yml/badge.svg)](https://github.com/Spkicn/zt9612-linux/actions/workflows/build.yml)
-[![checkpatch](https://github.com/Spkicn/zt9612-linux/actions/workflows/checkpatch.yml/badge.svg)](https://github.com/Spkicn/zt9612-linux/actions/workflows/checkpatch.yml)
-[![License: GPL-2.0-only](https://img.shields.io/badge/License-GPL--2.0--only-blue.svg)](LICENSE)
+ZT9612U（ZTOP / 兆通微 ACEV100，USB ID `350b:9612`）的 Linux 驱动，在上游
+[Spkicn/zt9612-linux](https://github.com/Spkicn/zt9612-linux) v0.3.2 基础上修掉**固件看门狗
+导致的随机复位**：网卡用着用着变回光驱、整机断网几十秒。GPL-2.0，与芯片厂商无隶属关系。
 
-Linux 内核驱动，对应 VID:PID 为 `350b:9612` 的 ZT9612U / ACEV100 USB 无线网卡。
+## 能不能用
 
-## 项目状态
-
-最新发布 **0.3.2**；`[Unreleased]` 里是 v0.4（上传快路径：固件站点会话 + A-MPDU 聚合 +
-WPA2 密钥路径；行为开关**默认关闭**，默认联网行为与 0.3.2 一致）。得到的是一个 managed
-模式的无线接口：双频扫描、WPA2-PSK 关联与加密、DHCP 与外网访问都已实机验证。
-
-**v0.4 的三大组件（`sta_add_fmt=7` 会话、`key_en=2` 加密、A-MPDU 聚合）也已实机走通，
-但都不提升吞吐**；截至 2026-10-05（r42–r44）的端到端数字与结论见下表。历史上
-"TX 死锁 / TXQ 计量 / 35 倍差 / 固件消费衰减 / 毒物块"等多版归因均已证伪或更正，
-过程与证据见 [CHANGELOG.md](CHANGELOG.md) `[Unreleased]`。
-
-| 能力 | 状态 |
+| 项目 | 结论 |
 |---|---|
-| 固件装载 · IPC 初始化 · `/dev/zt9612` | 完成，已实机验证 |
-| mac80211：接口 · 双频扫描 · 关联 · 数据面 · 5 GHz | 完成，已实机验证（5 GHz 自 0.3.1 起真正可用） |
-| WPA2-PSK 加密 · DHCP · 外网访问 | 完成，已实机验证（CCMP 由 mac80211 软件加解密） |
-| 上传快路径（会话 / 密钥 / A-MPDU 聚合） | 已实机走通，开关默认关；聚合可长跑但**不提速** |
-| WPA2-Enterprise · AP 模式 · 蓝牙 · 80 MHz | 未实现 |
+| 网卡 | USB ID `350b:9612`。实测机型 COMFAST CF-945F（AX1800 USB，模组 ZT9612U V1.0） |
+| 出厂状态 | 默认枚举为光驱 `350b:f179`，需切一次模式才能当网卡用（脚本已带自动切换） |
+| 内核 | 6.12 及以上可编译；实机验证过 7.0.0-31 / 7.0.0-34 / 7.0.0-42（Ubuntu 24.04 x86_64） |
+| 工作模式 | 仅 managed（STA）：双频扫描、WPA2-PSK、DHCP、IPv4/IPv6 数据面 |
+| 未实现 | AP 模式、监听与注入、蓝牙、80 MHz、WPA2-Enterprise（代码路径未验证） |
+| 固件 | 需自备 `zt9612_fw.bin` + `zt9612_settings.bin`，仓库不分发（厂商版权） |
+| Secure Boot | 支持，需自行生成 MOK 密钥并注册 |
+| 不适用 | 同厂 `350b:9101`、`350b:9611` 等其它型号 |
 
-实测吞吐（**端到端**，对端为另一台设备上的 TCP sink，接收侧逐字节核对；2026-10-05 r42/r42d）：
+实测吞吐（端到端，对端为另一台设备上的 TCP sink，接收侧逐字节核对，数据来自上游）：5 GHz
+上传 12.7–14.9 Mbit/s、下载 18.5–20.4 Mbit/s；2.4 GHz 上传 6.5–7.5 Mbit/s。上传上限在固件
+TX 侧，主机侧改不动。`iw link` 里的速率数字是主机侧记账，不是真实发射速率。
 
-| 方向 | 2.4 GHz | 5 GHz |
-|---|---|---|
-| 上传 | 6.5–7.5 Mbit/s | **12.7–14.9 Mbit/s** |
-| 下载 | — | **18.5–20.4 Mbit/s** |
+## 安装
 
-> [!WARNING]
-> 早先这张表记的是"2.4G 约 4 / 5G 上传 3.7–4.7 Mbit/s"，那是**旧口径**（不同仪器、
-> 且当时 TX 侧还有 988 字节帧长上限等已修缺陷）——数字以本表为准。
-> **别拿厂商"95.3 Mbit/s"对比**：那是近端 sink 口径，不可比；见「已知问题」。
-> `iw link` 里的速率数字（1.0 Mbit/s 之类）**不是**真实发射速率，只是主机侧记账，
-> 不要用它衡量性能。
-
-### 版本要点
-
-- **0.3.0**：修掉 RX 缓冲过小导致"HTTP 200 之后收不到数据"的缺陷
-- **0.3.1**：修掉扫描时 5 GHz 信道的 band 标志写死成 0 —— **5 GHz 在此之前一直不可用**
-  （`iw scan` 里那些"5G BSS"其实是频点被错误标注的 2.4 GHz 帧）。修好后首次完成
-  5 GHz 关联，吞吐约为 2.4 GHz 的 2–3 倍
-- **0.3.2**：修掉 TX 侧 988 字节的帧长上限 —— **上传在此之前基本不可用**
-  （满尺寸 TCP 段全部被驱动静默丢弃）。修复后 `ping -M do` 1472 正常、上传可用
-
-改动细节与实测数据见 [CHANGELOG.md](CHANGELOG.md)。
-
-## 硬件
-
-| 项目 | 值 |
-|---|---|
-| 厂商 | ZTOP / 山东兆通微电子（Zhaotong Micro） |
-| 模组 | ZT9612U V1.0（FCC ID `2BOBE-ZT9612UV10`） |
-| 芯片平台 | ACEV100（自研 Wi-Fi 6 2T2R SoC，非 Realtek / MediaTek 方案） |
-| 网卡模式 | `350b:9612`，bcdDevice `0x0200`，iProduct `802.11ax 2x2 WLAN Adapter` |
-| 光盘模式 | `350b:f179`（USB CD-ROM，卷标 "Wi-Fi6 Adapter"） |
-| 接口 | 1 个，class `FF/FF/FF`，5 个 512 字节批量端点（EP4-IN / EP5-8-OUT） |
-| 固件 | `zt9612_fw.bin`（219,076 字节）+ `zt9612_settings.bin`（212 字节） |
-
-支持范围与 ID 判定方法见 [supported-device-IDs](supported-device-IDs)。同厂其它型号
-（`350b:9101`、`350b:9611` 等）不适用。
-
-## 功能范围
-
-已实现：
-
-- 把设备从驱动光盘模式切到网卡模式（标准 SCSI 弹出，不是厂商私有命令）
-- 完整复现固件下载协议：hello 握手、488 字节分块写入、末块整段 XOR16 校验、配置块、RUN
-- 同步 IPC 初始化：`MM_RESET`、`MM_VERSION`、厂商私有段、`MM_START`（约 6.5 秒）、
-  `MM_SET_IDLE`、`MM_ADD_IF`、`MM_SET_SLOTTIME`、`MM_SET_CHANNEL`
-- 5 秒心跳维持固件存活；`/dev/zt9612` 上收发原始 `WLAN` 帧
-- mac80211：managed 接口、**2.4 GHz 14 个信道（含 2484）+ 5 GHz 25 个信道**、
-  `hw_scan`（双频）、关联、WPA2-PSK、数据面（TCP/UDP/IPv6 均正常）
-- 扫描结果带**真实信号强度**（RX 描述符里的 int8 dBm，实测 −94 至 −23 dBm）
-
-尚未实现 / 仍属实验：
-
-- WPA2-Enterprise（802.1X）：代码路径未验证（当前实验环境没有 802.1X AP）
-- 主动扫描默认关闭（`scan_probe=0` 为被动）；`scan_probe=2` 的厂商 probe 回放已验证可用
-- **上传快路径**：固件站点会话（`sta_add_en`，默认关）、A-MPDU 聚合（`ampdu_en`，默认关）
-  与 WPA2 密钥路径（`key_en`，默认 2 = mac80211 软件加解密）都已实现且实机走通；三条路径
-  **都不提升实测吞吐**（速率由固件内部决定）。早期两版归因**均已作废**：①「`MM_STA_ADD`
-  登记后 8–40s 定时死亡」由 `sta_add_fmt=7` 拆除（r26）；②「连续聚合有限次数后打挂设备」
-  由 `agg_min_len=1549` + `agg_stop` 修掉（r40），并在真实 TCP 下长跑 10,930 次零断言（r42）
-  —— 详见 CHANGELOG `[Unreleased]`
-- **带宽协商**：`ht_width40=1`（HT40）实测**更慢且致死**（不采纳，默认关）；A-MSDU 大单帧
-  因两个 AP 都报 `amsdu=0` 无法协商，路线挂起
-- AP 模式、蓝牙、80 MHz 带宽
-- 提高实测速率：**发射速率**由固件内部决定，主机侧改不了（见「实现要点」与「已知问题」）
-
-这块网卡在 Windows 下工作正常。厂商没有公开发布 Linux 驱动，但存在内部版本，
-**向厂商索取是更省力的路线**。
-
-## 兼容性
-
-| 项目 | 值 |
-|---|---|
-| 已实机验证 | `7.0.0-31-generic`（Ubuntu 24.04.5 LTS，x86_64）：功能全通、0 Oops、0 WARNING |
-| 功能已验证 | `7.0.0-34-generic`（2026-09-27 复测）：固件装载、IPC 初始化、双频扫描、5 GHz 关联、DHCP、外网 `ping`、`ping -M do 1472` 全部通过，`dmesg` **0 WARNING**（首帧 TX 曾在 `net/mac80211/tx.c:3832` 触发一次，已修：进程上下文改用 `ieee80211_tx_dequeue_ni()`） |
-| 已验证可编译 | `6.17.0-1022-azure`（CI 阻塞作业，无告警）；CI 内核矩阵另在 **`6.12.112` / `6.14.11` / `6.16.12`**（Ubuntu mainline headers）上编译通过；`modinfo` 正确生成 `alias: usb:v350Bp9612d*` |
-| 编译下限 | 6.12（见 `dkms.conf` 的 `BUILD_EXCLUSIVE_KERNEL`）：驱动包含 6.12 才引入的 `linux/unaligned.h`；6.17 给 `config` 等 op 加了 `radio_idx`，驱动内有按 `LINUX_VERSION_CODE` 选择的转发，因此 6.12–6.16 也能编译 |
-| 未验证区间 | 6.12–6.16 的**运行**行为未验证（只做了编译取证，没有这些内核的实机）；6.12 以下不支持（缺 `linux/unaligned.h`） |
-| 构建依赖 | `build-essential`、`linux-headers-$(uname -r)` |
-
-驱动使用较新的 mac80211 ops 签名（`config(struct ieee80211_hw *, int radio_idx, u32 changed)`、
-`tx(struct ieee80211_hw *, struct ieee80211_tx_control *, struct sk_buff *)`）。其中 `config` 在
-6.17 才加上 `radio_idx`，6.12–6.16 是 `(hw, u32 changed)`，所以驱动里有一层按
-`LINUX_VERSION_CODE` 选择的转发来保住 6.12 下限（详见 CHANGELOG `[Unreleased]`）。
-更老的内核需要另加适配，欢迎提 PR 并附完整报错与 `uname -a`。
-
-## 安装与验收
-
-**完整步骤（含 Secure Boot / MOK 签名与 DKMS 补签）见 [INSTALL.md](INSTALL.md)。** 最简路径：
+前置：`build-essential` 与对应内核头文件；装好前别把现有网卡拔了。
 
 ```bash
-sudo ./scripts/install-firmware.sh /path/to/firmware-dir   # 固件自备；脚本校验 SHA-256
-sudo ./scripts/setup-mode-switch.sh                        # 插卡时自动从光驱模式切到网卡
-sudo ./install-driver.sh                                   # 编译、按需签名、安装并加载一次
-sudo dmesg | tail -30                                      # 期望 firmware loaded → M1+M2 done
-sudo python3 scripts/zt9612-devtest.py                     # 期望「往返成功 2/2」
+sudo ./scripts/install-firmware.sh <固件目录>   # 校验 SHA-256 后装到 /lib/firmware
+sudo ./scripts/setup-mode-switch.sh            # 插卡时自动从光盘模式切到网卡模式
+sudo ./install-driver.sh                       # 编译、按需签名、安装，并加载一次
+sudo ./install-driver.sh --dkms                # 同上，但走 DKMS，内核升级自动重建
 ```
 
-> [!IMPORTANT]
-> **手工加过守卫的机器**上是另一种情况：守卫文件里除了 `blacklist` 还可能有
-> `install zt9612 /bin/true`。那种环境下 `sudo modprobe zt9612` 会**静默返回 0 且什么都不做**
-> （实测 2026-09-27，内核 7.0.0-34），必须用 `sudo modprobe --ignore-install zt9612`。
+默认会写 `blacklist zt9612`，只挡插卡/开机自动加载，手动 `modprobe zt9612` 可用；要开机自动
+加载加 `--enable-autoload`。验收命令与期望输出、Secure Boot 签名、DKMS 补签见
+[docs/INSTALL.md](docs/INSTALL.md)。
 
-## 已知问题
+插上只看到光驱、或者装不上，见 [docs/FAQ.md](docs/FAQ.md) 与
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
-完整清单、处置步骤与反馈渠道见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。最要紧的三条：
+## 为什么需要这个补丁
 
-- **上传吞吐上限约 15 Mbit/s，主机侧无法再提**：七个提速杠杆已逐一实测证否，速率由固件内部
-  决定（见「项目状态」）。
-- **A-MPDU 聚合默认关闭**（`ampdu_en=0`）：打开后在真实 TCP 下可长跑（10,930 次零断言）但
-  **不提速**；UDP 无流控满压需同时开 `agg_pred_us>0`，否则会断言并 USB 重枚举。
-- **设备挂死后只能冷启动复位**：S5 关机 + RTC 唤醒；热重启无效，也不必物理拔插。
+固件要求主机周期性发心跳（`0x05c2`），超时即复位，设备退回 `350b:f179` 光盘模式，主机侧没有
+补救手段，只能断电重来。上游文档写的窗口是"超过 5 秒不发心跳"。
 
-## 文档
+上游把心跳周期设成 5000 ms，而实际周期是"设定值 + 本次执行耗时"。在本机用 usbmon 抓了
+809 秒共 200 次心跳：
 
-| 文档 | 内容 |
+| 统计量 | 值 |
 |---|---|
-| [INSTALL.md](INSTALL.md) | 安装、Secure Boot / MOK 签名、DKMS、验收命令与期望输出 |
-| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | 已知问题完整清单、挂死恢复、反馈渠道 |
-| [PARAMETERS.md](PARAMETERS.md) | 模块参数（36 个）与 `/dev/zt9612` 接口 |
-| [FAQ.md](FAQ.md) | 常见问题（Secure Boot、固件、挂死、rmmod 风险） |
-| [CHANGELOG.md](CHANGELOG.md) | 变更日志，含每轮实验的结论与更正 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献规范、DCO、AI 政策、禁提交清单 |
-| [zt9612.conf](zt9612.conf) | `/etc/modprobe.d` 参数模板（逐参数取值说明） |
-| [supported-device-IDs](supported-device-IDs) | USB ID 判定与不支持的同厂型号 |
+| 中位周期 | 5.12 s |
+| p90 / p99 | 5.18 s / 5.48 s |
+| 最大周期 | 5.49 s |
+| 短于 5 s 的次数 | 0 |
 
-## 路线图
+按文档口径这等于零余量。窗口真值没有测出来（只能由复位样本反推），所以不是每次心跳都复位，
+而是间隔被拉长时随时可能复位 —— 扫描持锁、命令在途、bulk 超时都会把它拉长。实测后果是
+2026-11-12 11:31–15:07 的 3.5 小时里 16 次 USB 断开，每次断 46–90 秒。
 
-| 事项 | 状态 |
-|---|---|
-| 聚合的工程化收口 | 待办：`agg_pred_us` 的 3000 µs 是单点取值，值得扫一次；A-MSDU 需一台支持它的对端 |
-| 干净开机自动加载复验 | 待办：通过后才能去掉 `install-driver.sh` 的默认 blacklist |
-| WPA2-Enterprise（802.1X） | 待办：代码路径未验证（实验环境没有 802.1X AP） |
-| 协议细节 | 收尾：`0x0104`、`0x0105`、`0x050e` 的精确语义 |
-| AP 模式 / 80 MHz / 蓝牙 | 范围外或可选 |
+## 改了什么
 
-更省力的替代路线是向厂商索取官方 Linux 驱动
-（`ZTOP_ACEV100_Android_wifi_bt_*.tar.gz`，内含 `build_linux.sh`）。取得后本仓库可以转为
-适配与维护的角色。
+只动 `driver/zt9612.c`（+104 / −17 行），其余代码与脚本和上游一致：
 
-## 实现要点
+1. 心跳默认周期 5000 ms 改为 2000 ms，新增模块参数 `hb_interval_ms`（200–60000，运行期可改）。
+2. 心跳改固定节拍：把本次执行耗时从下个周期里扣掉，最多扣一半，不再让周期随执行时间累加。
+3. 心跳补发点从等 CFM 的循环前移到命令发出之前，扫描期间的长睡眠改成分片睡眠。原因是固件
+   IPC 一问一答，命令在途时插一条心跳会占掉命令槽，原命令的 CFM 不再到达。
+4. 卸载收尾加固：mac80211 反注册之后再取消工作项、清空发送队列，两个回调入口加存活判断。
 
-- 线协议：所有主机与设备间的消息都走批量端点，统一帧格式为
-  `"WLAN" + u16 hlen + u16 type + payload[hlen]`；主机到设备走 EP8-OUT，设备到主机走 EP4-IN
-- 消息 ABI：CEVA RivieraWaves rwnx 血统，
-  `struct lmac_msg { u16 id; u16 dest; u16 src; u16 param_len; u32 param[]; }`，
-  主机侧 `src_id` 固定为 100；MM 段消息编号与开源 rwnx 枚举一致
-- 固件容器：`"ZT"` magic、`u16 pid`（`0x9612`）、`u8 count`，后接 `count` 个 19 字节段表项；
-  校验是对整段数据做 XOR16，不是每块
-- 同步语义：RUN 之后必须等到固件启动通知（`type=0x0100`）再发 `MM_RESET_REQ`，否则消息
-  丢失且永远等不到 CFM；每条 IPC 都要等到对应 CFM 才能发下一条
-- **TX 速率由固件决定**：28 字节 TX 描述符里没有速率/MCS 字段，厂商驱动也从不发速率消息，
-  因此主机侧补速率表、上报 TX status、声明 HT/VHT 都不改变实测吞吐
-- 厂商私有消息段（`0x01xx`、`0x02xx`、`0x05xx`）不在开源枚举中，实现上按实测序列
-  原样重放，不推测结构
+代码注释里写了每处改动的依据，逐条明细与实测数据见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
+仓库第二个提交（`driver: use a 2 s fixed-cadence firmware heartbeat`）就是完整补丁，可直接
+用 `git show` 审。
 
-## 参与贡献
+## 验证到什么程度
 
-见 [CONTRIBUTING.md](CONTRIBUTING.md)。目前最需要的是实机测试反馈（不同主板、不同内核，
-失败的 dmesg 同样有价值），以及向厂商索取官方 Linux 驱动包。
+同一台机器、同一张卡、同一个 AP：
 
-**遇到问题**：先查 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 与 [FAQ.md](FAQ.md)；仍未解决就到
-[Issues](https://github.com/Spkicn/zt9612-linux/issues) 反馈 —— 请附 `lsusb -d 350b:`、
-`uname -a` 与 `dmesg` 全段（模板见 [.github/ISSUE_TEMPLATE/bug_report.md](.github/ISSUE_TEMPLATE/bug_report.md)）；
-这些信息可以一条命令收齐：`sudo ./scripts/collect-debug-info.sh`。
+| 指标 | 上游 0.3.2（3.5 小时） | 本版本（17 小时 11 分） |
+|---|---|---|
+| 芯片看门狗复位（退回 `350b:f179`） | 16 次 | 0 次 |
+| USB 断开 | 16 次 | 1 次（开机时从出厂光盘模式切到网卡模式，非复位） |
+| `bulk OUT failed` | 多次 | 0 |
+| `-110` / `-71` | 有 | 0 / 0 |
+| oops / panic | 0 | 0 |
+
+17 小时里实际收发 RX 48.2 MB / 228,158 包、TX 763 KB / 7,935 包；扫描 64 次，其中 5 次扫描
+前置序列失败（都在改动上线初期，之后为 0，失败自动重试，不影响连接）。期间 AP 自己把信道
+从 165 换到 36，驱动随频点变化关联回同一 BSSID，用时约 4 秒。
+
+另有一段 4 小时、252 个采样点的观测（每点 1 分钟，记录默认路由、链路状态与三组 ping）：252 点
+全部满足"默认路由恰好一条且走无线"；250 点在同一 BSSID，另 2 点在改动之前的窗口；到网关的
+3 个 ping 中，228 点全通、22 点丢 1 个、1 点丢 2 个、1 点全丢；每小时一次的公网检查 4 次全部
+返回 HTTP 200。
+
+证据边界：单机、单卡、单个 AP（5 GHz，-57 至 -66 dBm）、Ubuntu 24.04 + 7.0.0-42。这些数字说明
+看门狗复位这条路径被堵住了，不等于所有环境都不再掉线 —— 供电异常、固件自身挂死仍会导致复位。
+
+复现命令：
+
+```bash
+journalctl -k -b 0 | grep -E 'zt9612|350b' | tail -50
+```
+
+## 仓库结构
+
+```text
+driver/               zt9612.c（单文件驱动）、Kbuild 兼用户入口的 Makefile
+scripts/              固件安装、模式切换、udev 规则、排障信息收集、IPC 自测
+install-driver.sh     一键安装：编译 / 签名 / 安装 / 加载 / blacklist
+uninstall-driver.sh   卸载文件（不执行 rmmod）
+dkms.conf             DKMS 定义，版本 0.3.2-hb1
+zt9612.conf           /etc/modprobe.d 参数模板，逐参数说明
+supported-device-IDs  USB ID 判定与不支持的同厂型号
+docs/                 INSTALL / TROUBLESHOOTING / PARAMETERS / FAQ / CHANGELOG
+firmware/             只有占位说明，二进制需自备
+```
+
+参数表见 [docs/PARAMETERS.md](docs/PARAMETERS.md)。日常只需要 `hb_interval_ms`，其余是上游的
+实验开关，默认值即正常行为。
+
+版本号 `0.3.2-hb1` = 上游 v0.3.2 + 上文改动；本仓库长跑用的 `.ko` 由这份源码编译（唯一差别是
+`MODULE_VERSION` 字符串）。
+
+## 已知限制
+
+- 默认不自动加载：`install-driver.sh` 写 `blacklist zt9612`。加 `--enable-autoload` 可开机自动
+  加载，但这条完整路径上游尚未复验。
+- 不要反复 `rmmod` / `insmod`：卸载时设备可能不应答在途 bulk-IN，驱动按设计宁可泄漏实例也不
+  UAF。换模块请重启机器。
+- 芯片挂死后只能冷启动复位：`systemctl poweroff` 断电再上电。热重启不断 VBUS，ROM 的固件
+  接收窗口不会重开。
+- 同一 SSID 有多个 BSS 且信号接近时，NetworkManager 会按单帧 RSSI 来回漫游（本机实测 20 分钟
+  4 次）。用 `nmcli con mod <连接名> 802-11-wireless.bssid <BSSID>` 固定到一个 BSS 可消除，代价
+  是该 BSS 变成单点。这是主机侧策略，与驱动无关。
+- 扫描前置序列偶发 CFM 超时（本机 64 次扫描 5 次），该轮扫描中止后由上层重试。
+- 驱动源码里有若干早期编辑损坏的中文注释（双重编码乱码），不影响编译，尚未清理。
 
 ## 来源与许可
 
-- 本驱动是独立实现，只依据设备对外可观测的行为（USB 描述符、总线上的请求与响应序列）
-  以及公开的 CEVA RivieraWaves rwnx 消息框架知识编写。仓库中不含任何厂商源码、
-  反编译产物或厂商二进制
-- 开发期的内部协议笔记、设备调试记录与测试资料不在本仓库中，保留在开发者本地。源码
-  注释中若出现 `re/`、`docs/` 之类的路径引用，指向的是那些未公开的内部资料
-- 与芯片厂商（ZTOP / 兆通微）无隶属关系，也未获其背书；厂商名与型号仅用于说明兼容性
-- 厂商固件与 Windows 驱动未随仓库分发，见 [firmware/README.md](firmware/README.md)
-- 参考了开源 AIC8800（rwnx 系）驱动的分层与消息框架思路，以及 morrownr、lwfinger 系列
-  驱动仓库在构建、DKMS 与文档组织上的做法
-- 内核接口与规范以 [kernel.org 文档](https://docs.kernel.org/) 为准
+上游 [Spkicn/zt9612-linux](https://github.com/Spkicn/zt9612-linux)，快照 `9b5dcfe`
+（2026-10-08，`PACKAGE_VERSION` 0.3.2），GPL-2.0-only。上游驱动是独立实现：只依据设备对外
+可观测的行为与公开的 CEVA RivieraWaves rwnx 消息框架编写，不含厂商源码、反编译产物或厂商
+二进制。本仓库是那份代码的再分发加心跳修复，保留原许可与原版权声明，修改说明见
+[NOTICE.md](NOTICE.md) 与 [LICENSE](LICENSE)。

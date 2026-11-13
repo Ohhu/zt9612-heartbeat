@@ -1,6 +1,6 @@
 # 安装与验收
 
-> 本文件是 [README.md](README.md) 的安装分册：准备固件 → 切换设备模式 → 编译安装 →
+> 本文件是 [README.md](../README.md) 的安装分册：准备固件 → 切换设备模式 → 编译安装 →
 > Secure Boot / MOK 签名 → 验收。驱动能做什么、性能如何、有哪些已知问题见 README。
 
 ## 安装
@@ -16,7 +16,7 @@ sudo ./scripts/install-firmware.sh /path/to/firmware-dir
 ```
 
 脚本会校验 SHA-256 后才安装。文件大小、哈希与来源说明见
-[firmware/README.md](firmware/README.md)。
+[firmware/README.md](../firmware/README.md)。
 
 ### 2. 切换设备模式
 
@@ -41,7 +41,7 @@ sudo usb_modeswitch -K -W -v 350b -p f179
 ```bash
 sudo ./install-driver.sh                     # 编译、按需签名、安装，并手动加载一次
 sudo ./install-driver.sh --dkms              # 通过 DKMS 安装，内核升级后自动重建
-sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载，见「已知问题」
+sudo ./install-driver.sh --enable-autoload   # 允许插卡或开机自动加载（见 ../README.md 已知限制）
 ```
 
 默认行为是安装模块到 `/lib/modules/$(uname -r)/extra/`，并写入
@@ -53,22 +53,16 @@ sudo modprobe zt9612
 ```
 
 > [!IMPORTANT]
-> **手工加过守卫的机器**上是另一种情况：守卫文件里除了 `blacklist` 还可能有
-> `install zt9612 /bin/true`。那种环境下 `sudo modprobe zt9612` 会**静默返回 0 且什么都不做**
-> （实测 2026-09-27，内核 7.0.0-34），必须用：
->
-> ```bash
-> sudo modprobe --ignore-install zt9612
-> ```
->
-> 手工加过守卫的机器上，`--enable-autoload` 会**整个删除**该 blacklist 文件（连同守卫）。
+> 守卫文件里除 `blacklist` 外若还有 `install zt9612 /bin/true`（手工加过守卫的机器），
+> 普通 `modprobe` 会静默返回 0 且不加载。这种机器用 `sudo modprobe --ignore-install zt9612`，
+> 细节见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
 也可以直接用 DKMS：
 
 ```bash
 sudo dkms install .                          # add、build、install 一步完成
 dkms status
-sudo dkms remove zt9612/0.3.2 --all
+sudo dkms remove zt9612/0.3.2-hb1 --all
 ```
 
 手动编译的等价流程：
@@ -139,7 +133,7 @@ zt9612 1-9:1.0: boot notify: type=0x0100 len=16
 zt9612 1-9:1.0: firmware loaded
 zt9612 1-9:1.0: === IPC init sequence ===
 zt9612 1-9:1.0: fw 0x0101: status=0 mac=XX:XX:XX:XX:XX:XX
-zt9612 1-9:1.0: MM_START_REQ (rf init, waiting 约 6.5s)
+zt9612 1-9:1.0: MM_START_REQ (rf init, waiting ~6.5s)
 zt9612 1-9:1.0: MM_START_CFM received (firmware up)
 zt9612 1-9:1.0: MM_ADD_IF_CFM: status=0 inst_nbr=0
 zt9612 1-9:1.0: M1+M2 done: firmware running, /dev/zt9612 ready
@@ -165,5 +159,15 @@ sudo python3 scripts/zt9612-devtest.py --seconds 20    # 顺带检查心跳稳�
 IFACE=$(ls /sys/class/net | grep -E '^(wlx|wlan)' | head -1)
 iw dev ; iw phy "$(iw dev "$IFACE" info | awk '/wiphy/{print "phy"$2}')" info | head -40
 ethtool -i "$IFACE" | head -2                 # 期望 driver: zt9612
-sudo iw dev "$IFACE" scan | grep -c '^BSS'    # 期望 40 个以上（双频）
+sudo iw dev "$IFACE" scan | grep -c '^BSS'    # 数量随环境而定，双频环境下一般是几十个
 ```
+
+## 卸载
+
+```bash
+sudo ./uninstall-driver.sh            # 删除已安装的 .ko 与 blacklist 文件
+sudo dkms remove zt9612/0.3.2-hb1 --all   # 用 DKMS 安装过的情形
+sudo rm -f /lib/firmware/zt9612_fw.bin /lib/firmware/zt9612_settings.bin   # 可选
+```
+
+脚本只删文件，**不执行 `rmmod`**：卸载路径仍可能让设备挂死，已加载的模块要重启后才消失。
