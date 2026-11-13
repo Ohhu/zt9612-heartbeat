@@ -5,7 +5,8 @@
  * M1 + M2:
  *   - 固件装载：批量写 488B 块 / 末块整段 XOR16 校验 / 配置块 / RUN
  *   - IPC 一问一答：每条等对应 CFM（RESET -> VERSION -> 设信道 -> START(约 6.5s) -> 配置）
- *   - 5 秒心跳 0x05c2（载荷为纯 ASCII），否则固件看门狗复位、设备退回光盘模式
+ *   - 心跳 0x05c2（载荷为纯 ASCII），默认每 2 秒一次（模块参数 hb_interval_ms），
+ *     否则固件看门狗（约 5 秒窗口）复位、设备退回光盘模式
  *   - /dev/zt9612 字符设备：原始报文通道，报文头 "WLAN" + u16 hlen + u16 type
  *
  * 协议来自 USB 抓包与实验记录：结论见仓库 CHANGELOG 与 re/REPORT*.md、re/DRIVER_PROGRESS.md
@@ -121,7 +122,27 @@
  */
 #define ZT_MAX_MTU	1500
 #define RX_FIFO_SIZE	(64 * 1024)
-#define HB_INTERVAL_MS	5000
+
+/*
+ * 心跳周期。
+ *
+ * 上游用 5000 ms，正好等于固件看门狗的容忍窗口（FAQ：主机超过 5 秒不发心跳
+ * 即看门狗复位、设备退回光盘模式）。2026-11-12 在本机用 usbmon 实测 809 秒、
+ * 200 次心跳：**中位周期 5.12 s、p99 5.48 s、最大 5.49 s** —— 一次都不到 5 s，
+ * 也就是说上游实现一直贴着看门狗边缘跑，任何一次额外的抖动（扫描持锁、
+ * bulk OUT 2000 ms 超时、工作队列排队）都会把间隔推到窗口之外。
+ *
+ * 这里改成 2000 ms：留出 2.5 倍余量，代价是每 2 秒多一条 40 字节 IPC
+ * （实测 1 Hz 心跳对空口与 CPU 无可测影响）。可用模块参数 hb_interval_ms
+ * 在 200..60000 范围内调整。
+ */
+#define HB_INTERVAL_DEFAULT_MS	2000
+#define HB_INTERVAL_MIN_MS	200
+#define HB_INTERVAL_MAX_MS	60000
+
+static int hb_interval_ms = HB_INTERVAL_DEFAULT_MS;
+module_param(hb_interval_ms, int, 0644);
+MODULE_PARM_DESC(hb_interval_ms, "firmware heartbeat period in ms (default 2000; firmware watchdog is about 5000)");
 
 /* M3.2 扫描 */
 #define ZT_MAX_SCAN_CH	48		/* 2.4G 14 + 5G 25；厂商一轮扫 39 个信道，留余量 */
@@ -807,6 +828,43 @@ static int zt_recv(struct zt_dev *z, u16 *type, int *len, int timeout_ms)
 
 /* ------------------------------------------------------------------ 韫囧啳鐑?*/
 
+static void zt_heartbeat(struct zt_dev *z);
+
+/* 当前生效的心跳周期（jiffies），越界时夹到 [200, 60000] ms */
+static unsigned long zt_hb_period(void)
+{
+	int ms = hb_interval_ms;
+
+	if (ms < HB_INTERVAL_MIN_MS)
+		ms = HB_INTERVAL_MIN_MS;
+	else if (ms > HB_INTERVAL_MAX_MS)
+		ms = HB_INTERVAL_MAX_MS;
+	return msecs_to_jiffies(ms);
+}
+
+/*
+ * 到点就补一条心跳。凡是"可能长时间持有 z->lock、又不走 zt_cmd*"的循环
+ * （扫描驻留、信道稳定等待）都必须调用它 —— 心跳一旦超窗，固件看门狗直接
+ * 把芯片打回光盘模式，主机侧没有任何补救手段。
+ */
+static void zt_hb_if_due(struct zt_dev *z)
+{
+	if (time_after(jiffies, z->last_hb + zt_hb_period()))
+		zt_heartbeat(z);
+}
+
+/* 分片睡眠，期间按需补心跳（单次睡眠不得跨过心跳周期） */
+static void zt_msleep_hb(struct zt_dev *z, unsigned int ms)
+{
+	while (ms) {
+		unsigned int step = ms > 50 ? 50 : ms;
+
+		zt_hb_if_due(z);
+		msleep(step);
+		ms -= step;
+	}
+}
+
 static void zt_heartbeat(struct zt_dev *z)
 {
 	struct timespec64 ts;
@@ -836,6 +894,8 @@ static void zt_heartbeat(struct zt_dev *z)
 static void zt_hb_work(struct work_struct *w)
 {
 	struct zt_dev *z = container_of(to_delayed_work(w), struct zt_dev, hb_work);
+	unsigned long period = zt_hb_period();
+	unsigned long t0 = jiffies;
 
 	if (!READ_ONCE(z->alive))
 		return;
@@ -843,8 +903,20 @@ static void zt_hb_work(struct work_struct *w)
 	if (READ_ONCE(z->alive) && z->rx_running)
 		zt_heartbeat(z);
 	mutex_unlock(&z->lock);
-	if (READ_ONCE(z->alive))
-		schedule_delayed_work(&z->hb_work, msecs_to_jiffies(HB_INTERVAL_MS));
+	if (!READ_ONCE(z->alive))
+		return;
+	/*
+	 * 按固定节拍排下一次，而不是"周期 + 本次耗时"。
+	 * 上游写法会让实际周期永远大于设定值（本机实测中位 5.12 s、p99 5.48 s，
+	 * 而看门狗窗口约 5 s）；这里把本次执行耗时从下一周期里扣掉，最多扣一半，
+	 * 避免一次超长执行把间隔压到 0 造成心跳风暴。
+	 */
+	{
+		unsigned long spent = jiffies - t0;
+		unsigned long next = spent < period / 2 ? period - spent : period / 2;
+
+		schedule_delayed_work(&z->hb_work, next);
+	}
 }
 
 /* ------------------------------------------------------------------ IPC 閸涙垝鎶?*/
@@ -868,6 +940,13 @@ static int zt_cmd(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 	if (plen && params)
 		memcpy(msg + 8, params, plen);
 
+	/*
+	 * 心跳必须在这条命令**发出去之前**补，不能等命令在途时插一条。
+	 * 固件的 IPC 是一问一答模型（AGENTS.md 铁律 4），命令尚未收到 CFM 时
+	 * 再塞一条心跳，会让固件的命令槽被占掉，原来的 CFM 就永远不来了
+	 * —— 现场表现正是 "scan: timeout waiting for cfm 0x0023"。
+	 */
+	zt_hb_if_due(z);
 	ret = zt_send(z, T_IPC, msg, 8 + plen);
 	if (ret)
 		return ret;
@@ -878,9 +957,6 @@ static int zt_cmd(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 	while (time_before(jiffies, end)) {
 		u16 type = 0;
 		int len = 0;
-
-		if (time_after(jiffies, z->last_hb + msecs_to_jiffies(HB_INTERVAL_MS)))
-			zt_heartbeat(z);
 
 		if (zt_recv(z, &type, &len, 100))
 			continue;
@@ -956,6 +1032,7 @@ static int zt_cmd_fifo(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 	if (plen && params)
 		memcpy(msg + 8, params, plen);
 
+	zt_hb_if_due(z);	/* 见 zt_cmd 里的说明：心跳只能在命令发出之前补 */
 	ret = zt_send(z, T_IPC, msg, 8 + plen);
 	if (ret)
 		return ret;
@@ -966,9 +1043,6 @@ static int zt_cmd_fifo(struct zt_dev *z, u16 id, const u8 *params, u16 plen,
 	while (time_before(jiffies, end)) {
 		u16 type = 0;
 		int len = 0;
-
-		if (time_after(jiffies, z->last_hb + msecs_to_jiffies(HB_INTERVAL_MS)))
-			zt_heartbeat(z);
 
 		if (zt_kfifo_recv(z, &type, &len, 50))
 			continue;
@@ -1019,6 +1093,7 @@ static int zt_cmd_fifo_resp(struct zt_dev *z, u16 id, const u8 *params, u16 plen
 	if (plen && params)
 		memcpy(msg + 8, params, plen);
 
+	zt_hb_if_due(z);	/* 见 zt_cmd 里的说明：心跳只能在命令发出之前补 */
 	ret = zt_send(z, T_IPC, msg, 8 + plen);
 	if (ret)
 		return ret;
@@ -1029,9 +1104,6 @@ static int zt_cmd_fifo_resp(struct zt_dev *z, u16 id, const u8 *params, u16 plen
 	while (time_before(jiffies, end)) {
 		u16 type = 0;
 		int len = 0;
-
-		if (time_after(jiffies, z->last_hb + msecs_to_jiffies(HB_INTERVAL_MS)))
-			zt_heartbeat(z);
 
 		if (zt_kfifo_recv(z, &type, &len, 50))
 			continue;
@@ -3761,6 +3833,8 @@ static void zt_mac_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *
 	unsigned long flags;
 	int i;
 
+	if (!READ_ONCE(z->alive))
+		return;			/* r62：卸载窗口内不再排新工作 */
 	WRITE_ONCE(z->txq_wakes, z->txq_wakes + 1);	/* r34: 每次回调都计 */
 	spin_lock_irqsave(&z->txq_lock, flags);
 	for (i = 0; i < z->txq_n; i++) {
@@ -3970,7 +4044,9 @@ static void zt_scan_work(struct work_struct *w)
 			z->scan_ch_5g++;
 		if (zt_cmd_fifo(z, 0x0010, chan, 12, 0x0011, 1000))
 			dev_warn(&z->intf->dev, "scan: 切换信道 %u 无 CFM\n", f);
-		msleep(20);			/* 让信道先稳定（厂商 SET_CHANNEL→TX 中位 16ms） */
+		/* 让信道先稳定（厂商 SET_CHANNEL→TX 中位 16ms）；期间照常补心跳，
+		 * 扫描持锁整轮最长可达数秒，不能指望 hb_work 抢到锁。 */
+		zt_msleep_hb(z, 20);
 		if (scan_probe) {
 			struct ieee80211_channel *ch = z->hw ?
 				ieee80211_get_channel(z->hw->wiphy, f) : NULL;
@@ -3985,7 +4061,7 @@ static void zt_scan_work(struct work_struct *w)
 			else
 				zt_scan_probe_vendor(z, f);
 		}
-		msleep(ZT_SCAN_DWELL_MS);
+		zt_msleep_hb(z, ZT_SCAN_DWELL_MS);
 	}
 	done = !aborted;
 	if (done) {
@@ -4048,6 +4124,8 @@ static int zt_mac_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	struct cfg80211_scan_request *req = &hw_req->req;
 	int i;
 
+	if (!READ_ONCE(z->alive))
+		return -ENODEV;		/* r62：卸载窗口内不再排新工作 */
 	if (READ_ONCE(z->scan_running))
 		return -EBUSY;
 	if (req->n_channels == 0 || req->n_channels > ZT_MAX_SCAN_CH)
@@ -4342,7 +4420,7 @@ static int zt_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (zt_ntf_start(z))
 		dev_warn(&intf->dev, "EP%u-IN 通知通道启动失败（继续，但 TX 吞吐可能受影响）\n",
 			 EP_NTF_NUM);
-	schedule_delayed_work(&z->hb_work, msecs_to_jiffies(HB_INTERVAL_MS));
+	schedule_delayed_work(&z->hb_work, zt_hb_period());
 
 	z->misc.minor = MISC_DYNAMIC_MINOR;
 	z->misc.name = "zt9612";
@@ -4415,6 +4493,15 @@ static void zt_disconnect(struct usb_interface *intf)
 		zt_dbg_root = NULL;
 	}
 	zt_mac_unregister(z);
+	/*
+	 * r62：撤掉 mac80211 之前的窗口里，hw_scan / wake_tx_queue 仍可能被回调，
+	 * 把 scan_work / tx_work 重新排上；此处再取消一次（此后 mac80211 不再回调，
+	 * 窗口关闭），并清掉可能又入队的 skb。否则工作项会在函数末尾 kfree(z)
+	 * 之后才执行 —— 设备掉总线时正好踩这条路径。
+	 */
+	cancel_work_sync(&z->scan_work);
+	cancel_work_sync(&z->tx_work);
+	skb_queue_purge(&z->txq);
 
 	zt_ntf_stop(z);		/* 通知通道：同样有界等待 */
 	if (zt_rx_stop(z)) {
@@ -4448,7 +4535,7 @@ module_usb_driver(zt_driver);
 
 MODULE_AUTHOR("Spkicn <Spkicn@users.noreply.github.com>");
 MODULE_DESCRIPTION("ZT9612U (ZTOP/ACEV100) USB WiFi driver - mac80211 station: 2.4/5 GHz scan, connect, WPA2");
-MODULE_VERSION("0.3.2");
+MODULE_VERSION("0.3.2-hb1");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE("zt9612_fw.bin");
 MODULE_FIRMWARE("zt9612_settings.bin");
